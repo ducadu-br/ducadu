@@ -36,20 +36,20 @@ DEFAULT_MERCHANT = os.getenv(
 
 
 @st.cache_resource
-def ifood_client():
+def ifood_client(credential: str = "finance"):
     from src.ifood.client import IfoodClient
 
-    return IfoodClient()
+    return IfoodClient(credential=credential)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_merchants():
-    return ifood_client().list_merchants()
+    return ifood_client("finance").list_merchants()
 
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_sales_api(merchant_id: str, begin: date, end: date) -> list[dict]:
-    client = ifood_client()
+    client = ifood_client("finance")
     rows: list[dict] = []
     for payload in client.iter_sales_pages(merchant_id, begin=begin, end=end):
         for sale in payload.get("sales") or []:
@@ -126,7 +126,7 @@ def fetch_analytics_kpis(merchant_id: str, gte: str, lte: str, group_fields: tup
         lte=lte,
         group_by=list(group_fields) if group_fields else None,
     )
-    return ifood_client().post_merchant_order_kpis(merchant_id, body)
+    return ifood_client("bi").post_merchant_order_kpis(merchant_id, body)
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -137,7 +137,7 @@ def fetch_reviews_api(
     page: int = 1,
     size: int = 10,
 ) -> dict:
-    return ifood_client().list_reviews(
+    return ifood_client("review").list_reviews(
         merchant_id,
         begin=begin,
         end=end,
@@ -149,7 +149,7 @@ def fetch_reviews_api(
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_review_detail(merchant_id: str, review_id: str) -> dict:
-    return ifood_client().get_review(merchant_id, review_id.strip())
+    return ifood_client("review").get_review(merchant_id, review_id.strip())
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -214,9 +214,10 @@ def fetch_kpis_group_by_status(merchant_id: str, begin: date, end: date) -> dict
     if begin != end:
         gte, lte = f"{begin.isoformat()} 00:00:00", f"{end.isoformat()} 23:59:59"
     body = orders_kpis_body_order_status(gte=gte, lte=lte)
-    return ifood_client().post_merchant_order_kpis(merchant_id, body)
+    return ifood_client("bi").post_merchant_order_kpis(merchant_id, body)
 
 
+@st.cache_data(ttl=120, show_spinner=False)
 def fetch_analytics_status_counts_db(
     merchant_id: str,
     begin: date,
@@ -258,6 +259,43 @@ def fetch_analytics_status_counts_db(
     return merged, last_raw
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_financial_month_stats_db(
+    merchant_id: str,
+    begin: date,
+    end: date,
+) -> tuple[int, int, int]:
+    """Pedidos / cancelados / concluídos a partir de ifood_orders (Financial ingest)."""
+    from src.db import get_conn
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*)::int,
+                    COUNT(*) FILTER (
+                        WHERE UPPER(COALESCE(current_status, '')) LIKE '%CANCEL%'
+                    )::int,
+                    COUNT(*) FILTER (
+                        WHERE UPPER(COALESCE(current_status, '')) LIKE '%CONCLUD%'
+                    )::int
+                FROM ifood_orders
+                WHERE merchant_id = %s::uuid
+                  AND sales_date BETWEEN %s AND %s
+                """,
+                (merchant_id, begin, end),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return 0, 0, 0
+    return int(row[0]), int(row[1]), int(row[2])
+
+
+@st.cache_data(ttl=120, show_spinner=False)
 def fetch_review_summary_db(merchant_id: str, as_of: date) -> dict | None:
     from src.db import get_conn
 
@@ -364,25 +402,22 @@ def _monthly_review_average_api(merchant_id: str, begin: date, end: date) -> flo
 def render_performance_metas_tab(
     *,
     merchant_id: str,
+    start_d: date,
     end_d: date,
     homolog: bool,
     use_db: bool,
     sales_df: pd.DataFrame,
 ) -> None:
-    month_begin, month_end = calendar_month_through(end_d)
+    period_begin, period_end = start_d, end_d
     st.subheader("Desempenho & metas (visão iFood)")
     if homolog:
         st.caption(
-            f"Mês de referência: **{month_begin.strftime('%Y-%m')}** ({month_begin} → {month_end}). "
-            "**Homologação:** métricas de pedidos via **Neon (ingest Analytics)** se a flag estiver marcada; "
-            "senão API ao vivo. Indicadores Ducadu (Falaê, nutricionista, chamados, score) = wireframe."
+            f"Período (mesmo De/Até da sidebar): **{period_begin}** → **{period_end}**. "
+            "Com **Neon**, pedidos = `ifood_orders` (Financial). KPIs Analytics só na tabela abaixo."
         )
-        if metrics_source:
-            st.caption(f"Fonte pedidos/cancelados: **{metrics_source}**")
     else:
         st.caption(
-            f"Mês de referência: **{month_begin.strftime('%Y-%m')}** "
-            f"({month_begin} → {month_end}, D-1). Spec: `docs/dashboard-metas-cadu.md`."
+            f"Período: **{period_begin}** → **{period_end}**. Spec: `docs/dashboard-metas-cadu.md`."
         )
 
     with st.expander("Metas do mês (protótipo — depois `dim_metas_loja`)", expanded=False):
@@ -398,37 +433,60 @@ def render_performance_metas_tab(
     kpi_payload: dict | None = None
     kpi_error: str | None = None
     metrics_source = ""
+    fin_total = fin_cancel = fin_concluded = 0
 
     if use_db:
         try:
-            status_counts, kpi_payload = fetch_analytics_status_counts_db(
-                merchant_id, month_begin, month_end
+            fin_total, fin_cancel, fin_concluded = fetch_financial_month_stats_db(
+                merchant_id, period_begin, period_end
             )
-            if status_counts:
-                metrics_source = "Neon (`ifood_analytics_kpi_daily`)"
+            metrics_source = "Neon — pedidos `ifood_orders` (Financial)"
         except Exception as exc:
             kpi_error = str(exc)
+        try:
+            status_counts, kpi_payload = fetch_analytics_status_counts_db(
+                merchant_id, period_begin, period_end
+            )
+            if status_counts:
+                metrics_source += "; cancel/status `ifood_analytics_kpi_daily`"
+        except Exception as exc:
+            kpi_error = kpi_error or str(exc)
 
     if not status_counts and not (homolog and use_db):
         try:
-            kpi_payload = fetch_kpis_group_by_status(merchant_id, month_begin, month_end)
+            kpi_payload = fetch_kpis_group_by_status(merchant_id, period_begin, period_end)
             status_counts = parse_order_status_counts(kpi_payload)
-            if status_counts:
+            if status_counts and not use_db:
                 metrics_source = "API Analytics (ao vivo)"
         except Exception as exc:
-            kpi_error = str(exc)
-    elif not status_counts and use_db:
+            kpi_error = kpi_error or str(exc)
+    elif not status_counts and use_db and not fin_total:
         kpi_error = (
             kpi_error
-            or "Nenhum KPI ingerido no período — rode `ingest_ifood` e aplique `sql/004_ifood_analytics.sql`."
+            or "Nenhum dado ingerido no período — rode `ingest_ifood` (Financial + Analytics)."
         )
+
+    if metrics_source:
+        st.caption(f"Fonte: **{metrics_source}**")
 
     total_orders = 0
     cancelled = 0
     concluded = 0
     cancel_pct = 0.0
 
-    if status_counts:
+    if use_db:
+        total_orders = fin_total
+        cancelled = fin_cancel
+        concluded = fin_concluded
+        base_denom = total_orders if total_orders > 0 else max(concluded + cancelled, 1)
+        cancel_pct = 100.0 * cancelled / base_denom if base_denom else 0.0
+        if not fin_total and status_counts:
+            st.info(
+                "Nenhum pedido em **`ifood_orders`** neste De/Até. "
+                f"A tabela Analytics abaixo soma **{sum(status_counts.values())}** eventos agregados KPI — "
+                "não substitui contagem Financial."
+            )
+    elif status_counts:
         total_orders = sum(status_counts.values())
         cancelled = status_counts.get("CANCELLED", 0) + status_counts.get("CANCELED", 0)
         concluded = status_counts.get("CONCLUDED", 0)
@@ -439,7 +497,7 @@ def render_performance_metas_tab(
             df_m = sales_df
         else:
             try:
-                df_m = pd.DataFrame(fetch_sales_api(merchant_id, month_begin, month_end))
+                df_m = pd.DataFrame(fetch_sales_api(merchant_id, period_begin, period_end))
             except Exception:
                 df_m = sales_df
         total_orders, cancelled, concluded = count_orders_from_sales_df(df_m)
@@ -451,45 +509,46 @@ def render_performance_metas_tab(
     summary_score: float | None = None
     if use_db:
         try:
-            summary_raw = fetch_review_summary_db(merchant_id, month_end)
+            summary_raw = fetch_review_summary_db(merchant_id, period_end)
             if summary_raw:
                 summary_score = _extract_summary_score(summary_raw)
         except Exception:
             pass
     if summary_score is None:
         try:
-            summary = ifood_client().get_review_summary(merchant_id)
+            summary = ifood_client("review").get_review_summary(merchant_id)
             if summary:
                 summary_score = _extract_summary_score(summary)
         except Exception:
             pass
 
     if homolog:
-        month_avg = _monthly_review_average_api(merchant_id, month_begin, month_end)
+        month_avg = _monthly_review_average_api(merchant_id, period_begin, period_end) if not use_db else None
+        if use_db:
+            month_avg = _monthly_review_average(merchant_id, period_begin, period_end)
     elif use_db:
-        month_avg = _monthly_review_average(merchant_id, month_begin, month_end)
+        month_avg = _monthly_review_average(merchant_id, period_begin, period_end)
         if month_avg is None:
-            month_avg = _monthly_review_average_api(merchant_id, month_begin, month_end)
+            month_avg = _monthly_review_average_api(merchant_id, period_begin, period_end)
     else:
-        month_avg = _monthly_review_average_api(merchant_id, month_begin, month_end)
+        month_avg = _monthly_review_average_api(merchant_id, period_begin, period_end)
 
     st.markdown("#### Indicadores do mês")
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)
     if homolog:
         r1c1.metric(
             "Pedidos iFood (total)",
-            str(total_orders) if status_counts else "—",
-            help="Analytics KPIs · groupBy orderStatus",
+            str(total_orders) if use_db else (str(total_orders) if status_counts else "—"),
+            help="Neon: linhas em `ifood_orders` no De/Até. Sem Neon: Analytics API.",
         )
         r1c2.metric(
             "Cancelados",
-            str(cancelled) if status_counts else "—",
-            f"{cancel_pct:.2f}%" if status_counts else "—",
+            str(cancelled) if use_db else (str(cancelled) if status_counts else "—"),
+            f"{cancel_pct:.2f}%" if use_db or status_counts else "—",
         )
         r1c3.metric(
             "Concluídos",
-            str(concluded) if status_counts else "—",
-            help="Analytics KPIs",
+            str(concluded) if use_db else (str(concluded) if status_counts else "—"),
         )
     else:
         r1c1.metric("Pedidos iFood (total)", total_orders)
@@ -546,9 +605,12 @@ def render_performance_metas_tab(
         else:
             st.info("Configure ingest + período com pedidos para calcular atingimento.")
 
-    if status_counts:
-        st.markdown("**Distribuição por status (Analytics iFood)**")
-        base = total_orders if total_orders > 0 else 1
+    if status_counts and (not use_db or sum(status_counts.values()) != total_orders):
+        st.markdown("**Distribuição por status (Analytics iFood ingerido)**")
+        st.caption(
+            "Soma dos KPIs diários no período — pode divergir de `ifood_orders` no sandbox ou na regra Financial."
+        )
+        base = sum(status_counts.values()) or 1
         st.dataframe(
             pd.DataFrame(
                 [{"status": k, "pedidos": v, "%": f"{100.0 * v / base:.1f}"} for k, v in sorted(status_counts.items())]
@@ -566,17 +628,24 @@ def render_performance_metas_tab(
 
 
 def render_homolog_dashboard(*, show_page_header: bool = True) -> None:
+    from src.config import ifood_credentials
+
     homolog = os.getenv("IFOOD_USE_HOMOLOGATION", "true").lower() in ("1", "true", "yes")
-    client_id = os.getenv("IFOOD_CLIENT_ID", "")
+    fin_id, _ = ifood_credentials("finance")
+    bi_id, _ = ifood_credentials("bi")
+    rev_id, _ = ifood_credentials("review")
 
     if show_page_header:
-        st.subheader("Dash Gerencial — iFood (homologação)")
+        title = "Dash Gerencial — iFood (homologação)" if homolog else "Dash Gerencial — iFood (produção)"
+        st.subheader(title)
         st.caption(
-            "Módulos iFood (Financial, Analytics, Review) — read-only, homologação. "
+            "Módulos iFood (Financial, Analytics, Review) — read-only. "
             "Metas operacionais Ducadu (Falaê, nutricionista) entram na Fase 3 do dashboard."
         )
     if homolog:
         st.info("Ambiente de **homologação** (`x-request-homologation: true`). Dados sintéticos/fixtures são esperados.")
+    else:
+        st.success("Ambiente de **produção** (sem header de homologação).")
 
     merchants = fetch_merchants()
     merchant_options = {
@@ -585,7 +654,10 @@ def render_homolog_dashboard(*, show_page_header: bool = True) -> None:
         if m.get("id")
     }
     if not merchant_options:
-        st.error("Nenhum merchant retornado pelo token. Verifique IFOOD_CLIENT_ID / SECRET no .env.")
+        st.error(
+            "Nenhum merchant retornado pelo app Finanças. Verifique IFOOD_FINANCE_* "
+            "(ou IFOOD_CLIENT_ID legado) e autorização das lojas no portal iFood."
+        )
         st.stop()
 
     default_label = next(
@@ -597,11 +669,16 @@ def render_homolog_dashboard(*, show_page_header: bool = True) -> None:
     idx = labels.index(default_label) if default_label in labels else 0
 
     with st.sidebar:
-        st.header("Homologação")
+        st.header("iFood API")
         st.caption(f"UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
-        st.caption(f"Ambiente: **teste** · header homologação: **{homolog}**")
-        if client_id:
-            st.caption(f"client_id: `{client_id}`")
+        env_label = "teste/homolog" if homolog else "produção"
+        st.caption(f"Ambiente: **{env_label}** · header homologação: **{homolog}**")
+        if fin_id:
+            st.caption(f"Finanças: `{fin_id}`")
+        if bi_id:
+            st.caption(f"BI: `{bi_id}`")
+        if rev_id:
+            st.caption(f"Avaliações: `{rev_id}`")
         st.divider()
         st.header("Filtros")
         merchant_label = st.selectbox("Loja", labels, index=idx, key="ifood_merchant")
@@ -676,6 +753,7 @@ def render_homolog_dashboard(*, show_page_header: bool = True) -> None:
     with tab_analytics:
         render_performance_metas_tab(
             merchant_id=merchant_id,
+            start_d=start_d,
             end_d=end_d,
             homolog=homolog,
             use_db=use_db,
@@ -684,6 +762,12 @@ def render_homolog_dashboard(*, show_page_header: bool = True) -> None:
 
     with tab_review:
         st.subheader("Review v2 — leitura")
+        if homolog:
+            st.info(
+                "**Sandbox Review:** a loja de teste (`8021db2f-…`) costuma vir **sem avaliações** no período. "
+                "Isso é normal — o vídeo de homologação valida **listagem, filtros, paginação e detalhe** (com `reviewId` "
+                "informado pelo iFood se a lista vier vazia). Summary pode retornar **404**."
+            )
         st.caption(
             "Homologação (escopo read-only BI): listar, filtrar por data, paginar e detalhar. "
             "POST /answers **não** exigido conforme confirmação iFood na triagem."
@@ -693,7 +777,7 @@ def render_homolog_dashboard(*, show_page_header: bool = True) -> None:
         rev_size = st.selectbox("Itens por página", [10, 25, 50], index=0, key="rev_size")
 
         try:
-            summary = ifood_client().get_review_summary(merchant_id)
+            summary = ifood_client("review").get_review_summary(merchant_id)
             if summary:
                 st.json(summary)
             else:

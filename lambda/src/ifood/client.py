@@ -12,11 +12,12 @@ from src.ifood.auth import get_access_token
 class IfoodClient:
     """Thin wrapper around iFood Merchant API (read-only helpers for ingest)."""
 
-    def __init__(self, *, timeout: int = DEFAULT_TIMEOUT) -> None:
+    def __init__(self, *, credential: str = "default", timeout: int = DEFAULT_TIMEOUT) -> None:
+        self._credential = credential
         self._timeout = timeout
 
     def _headers(self) -> dict[str, str]:
-        headers = {"Authorization": f"Bearer {get_access_token()}"}
+        headers = {"Authorization": f"Bearer {get_access_token(credential=self._credential)}"}
         if IFOOD_USE_HOMOLOGATION_HEADER:
             headers["x-request-homologation"] = "true"
         return headers
@@ -69,6 +70,65 @@ class IfoodClient:
 
     def get_order(self, order_id: str) -> dict:
         return self._request("GET", f"/order/v1.0/orders/{order_id}")
+
+    def list_financial_events(
+        self,
+        merchant_id: str,
+        *,
+        begin: date,
+        end: date,
+        page: int = 1,
+    ) -> dict:
+        """Financial Events API (janela máxima documentada: 33 dias)."""
+        return self._request(
+            "GET",
+            f"/financial/v3.0/merchants/{merchant_id}/financial-events",
+            params={
+                "beginDate": begin.isoformat(),
+                "endDate": end.isoformat(),
+                "page": str(page),
+            },
+        )
+
+    def get_reconciliation(self, merchant_id: str, *, competence: str) -> dict:
+        """Reconciliation API — competência YYYY-MM. Retorna link do CSV e totalizadores."""
+        return self._request(
+            "GET",
+            f"/financial/v3.0/merchants/{merchant_id}/reconciliation",
+            params={"competence": competence},
+        )
+
+    def list_settlements(
+        self,
+        merchant_id: str,
+        *,
+        begin_calculation: date,
+        end_calculation: date,
+    ) -> dict:
+        return self._request(
+            "GET",
+            f"/financial/v3.0/merchants/{merchant_id}/settlements",
+            params={
+                "beginCalculationDate": begin_calculation.isoformat(),
+                "endCalculationDate": end_calculation.isoformat(),
+            },
+        )
+
+    def list_anticipations(
+        self,
+        merchant_id: str,
+        *,
+        begin_calculation: date,
+        end_calculation: date,
+    ) -> dict:
+        return self._request(
+            "GET",
+            f"/financial/v3.0/merchants/{merchant_id}/anticipations",
+            params={
+                "beginCalculationDate": begin_calculation.isoformat(),
+                "endCalculationDate": end_calculation.isoformat(),
+            },
+        )
 
     def list_sales(
         self,

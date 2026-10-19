@@ -12,6 +12,8 @@ Documento alinhado ao que está implementado no repositório: **admin web** (log
 
 **Ambiente iFood:** credenciais de **teste** no Developer Portal + `IFOOD_USE_HOMOLOGATION=true` no `.env` da raiz → header `x-request-homologation: true` em todas as chamadas Merchant API.
 
+**Produção (após homologação):** três apps no portal (Finanças, BI, Avaliações) → `IFOOD_FINANCE_*`, `IFOOD_BI_*`, `IFOOD_REVIEW_*` + `IFOOD_USE_HOMOLOGATION=false`. O app de teste (`IFOOD_CLIENT_ID` legado) pode permanecer só para sandbox. Ver seção [Cutover produção](#cutover-produção) abaixo.
+
 ---
 
 ## Confirmação iFood (Review read-only)
@@ -247,6 +249,17 @@ Não incluir `client_secret` nem tokens completos.
 | Review sem itens | Comum na loja teste; paginação + JSON lista ainda validam leitura |
 
 ---
+
+## Cutover produção
+
+Checklist após aprovação do iFood (três apps de produção):
+
+1. **Autorizar lojas** — cada unidade Ducadu deve autorizar os **três** `client_id` no fluxo do Portal do Parceiro (ou rede, se o app BI for por `chain_id`). Sem isso, `GET /merchants` ou as APIs retornam vazio/403.
+2. **`.env` local / Lambda** — `IFOOD_USE_HOMOLOGATION=false`; secrets `IFOOD_FINANCE_*`, `IFOOD_BI_*`, `IFOOD_REVIEW_*` (não commitar). Opcional: `IFOOD_MERCHANT_IDS=uuid1,uuid2` para limitar ingest.
+3. **Deploy Lambda** — replicar as mesmas variáveis no secret/ambiente AWS do `ingest_ifood`.
+4. **Smoke test** — `uv run --project apps/ifood_homolog python apps/ifood_homolog/auth_demo.py` (ainda usa legado; melhor abrir Streamlit e listar lojas na aba Financial).
+5. **Ingest D-1** — rodar lambda ou `scripts/run_ifood_ingest_local.py` para ontem; validar Neon (`ifood_orders`, `ifood_analytics_kpi_daily`, `ifood_reviews`).
+6. **Review “parcialmente homologado”** — normal: Merchant não foi homologado de novo no app Avaliações; o módulo Review em si já está liberado (mensagem do suporte).
 
 ## Referências
 

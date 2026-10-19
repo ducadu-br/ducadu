@@ -32,6 +32,14 @@ def resolve_merchant_ids(client: IfoodClient) -> list[str]:
     return [m["id"] for m in client.list_merchants() if m.get("id")]
 
 
+def _ingest_clients() -> tuple[IfoodClient, IfoodClient, IfoodClient]:
+    return (
+        IfoodClient(credential="finance"),
+        IfoodClient(credential="bi"),
+        IfoodClient(credential="review"),
+    )
+
+
 def _payment_total(sale: dict) -> float | None:
     methods = (sale.get("payments") or {}).get("methods") or []
     if not methods:
@@ -419,8 +427,8 @@ def main(
     incremental: bool = True,
     merchants: list[str] | None = None,
 ) -> None:
-    client = IfoodClient()
-    merchant_ids = merchants or resolve_merchant_ids(client)
+    finance_client, bi_client, review_client = _ingest_clients()
+    merchant_ids = merchants or resolve_merchant_ids(finance_client)
     if not merchant_ids:
         raise RuntimeError("Nenhum merchant iFood configurado ou retornado pela API")
 
@@ -435,26 +443,26 @@ def main(
         for day_start, _day_end in daterange(start_date, end_date):
             day = day_start.date()
             total_orders += _ingest_sales_day(
-                client,
+                finance_client,
                 merchant_id=merchant_id,
                 day=day,
                 incremental=incremental,
                 fetch_order_details=fetch_order_details,
             )
             total_reviews += _ingest_reviews_day(
-                client,
+                review_client,
                 merchant_id=merchant_id,
                 day=day,
                 incremental=incremental,
             )
             total_analytics += _ingest_analytics_day(
-                client,
+                bi_client,
                 merchant_id=merchant_id,
                 day=day,
                 incremental=incremental,
             )
             total_summaries += _ingest_review_summary_day(
-                client,
+                review_client,
                 merchant_id=merchant_id,
                 day=day,
                 incremental=incremental,

@@ -24,6 +24,32 @@ IFOOD_USE_HOMOLOGATION_HEADER = os.getenv("IFOOD_USE_HOMOLOGATION", "true").lowe
     "yes",
 )
 
+# Production: one Developer Portal app per category (Finanças, BI, Avaliações).
+# Homolog/sandbox: legacy IFOOD_CLIENT_ID / IFOOD_CLIENT_SECRET only.
+_IFOOD_APP_ENV: dict[str, tuple[str, list[str]]] = {
+    "finance": ("IFOOD_FINANCE_CLIENT_ID", ["IFOOD_FINANCE_SECRET", "IFOOD_FINANCE_CLIENT_SECRET"]),
+    "bi": ("IFOOD_BI_CLIENT_ID", ["IFOOD_BI_SECRET", "IFOOD_BI_CLIENT_SECRET"]),
+    "review": ("IFOOD_REVIEW_CLIENT_ID", ["IFOOD_REVIEW_SECRET", "IFOOD_REVIEW_CLIENT_SECRET"]),
+}
+
+
+def ifood_credentials(app: str) -> tuple[str, str]:
+    """Resolve OAuth client_id/secret for finance | bi | review | default."""
+    if app == "default":
+        return IFOOD_CLIENT_ID or "", IFOOD_CLIENT_SECRET or ""
+    spec = _IFOOD_APP_ENV.get(app)
+    if not spec:
+        raise ValueError(f"Unknown iFood app credential: {app}")
+    client_id = os.getenv(spec[0]) or ""
+    secret = ""
+    for key in spec[1]:
+        secret = os.getenv(key) or ""
+        if secret:
+            break
+    if client_id and secret:
+        return client_id, secret
+    return IFOOD_CLIENT_ID or "", IFOOD_CLIENT_SECRET or ""
+
 # --------------------------------------------------
 # AUTH
 # --------------------------------------------------

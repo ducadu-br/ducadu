@@ -7,25 +7,28 @@ from src.config import (
     DEFAULT_RETRIES,
     DEFAULT_TIMEOUT,
     IFOOD_AUTH_URL,
-    IFOOD_CLIENT_ID,
-    IFOOD_CLIENT_SECRET,
+    ifood_credentials,
 )
 
-_TOKEN_CACHE: dict[str, Any] = {
-    "access_token": None,
-    "expires_at": 0.0,
-}
+_TOKEN_CACHE: dict[str, dict[str, Any]] = {}
 
 _REFRESH_BUFFER_SEC = 120
 
 
-def get_access_token(*, force_refresh: bool = False) -> str:
-    if not IFOOD_CLIENT_ID or not IFOOD_CLIENT_SECRET:
-        raise ValueError("IFOOD_CLIENT_ID and IFOOD_CLIENT_SECRET must be set")
+def get_access_token(*, credential: str = "default", force_refresh: bool = False) -> str:
+    client_id, client_secret = ifood_credentials(credential)
+    if not client_id or not client_secret:
+        raise ValueError(
+            f"iFood OAuth credentials missing for app={credential!r} "
+            "(set IFOOD_*_CLIENT_ID/SECRET or legacy IFOOD_CLIENT_ID/SECRET)"
+        )
+
+    cache_key = f"{credential}:{client_id}"
+    bucket = _TOKEN_CACHE.setdefault(cache_key, {"access_token": None, "expires_at": 0.0})
 
     now = time.time()
-    cached = _TOKEN_CACHE.get("access_token")
-    expires_at = float(_TOKEN_CACHE.get("expires_at") or 0)
+    cached = bucket.get("access_token")
+    expires_at = float(bucket.get("expires_at") or 0)
     if cached and not force_refresh and now < expires_at - _REFRESH_BUFFER_SEC:
         return cached
 
@@ -35,8 +38,8 @@ def get_access_token(*, force_refresh: bool = False) -> str:
             response = requests.post(
                 IFOOD_AUTH_URL,
                 data={
-                    "clientId": IFOOD_CLIENT_ID,
-                    "clientSecret": IFOOD_CLIENT_SECRET,
+                    "clientId": client_id,
+                    "clientSecret": client_secret,
                     "grantType": "client_credentials",
                 },
                 timeout=DEFAULT_TIMEOUT,
@@ -48,8 +51,8 @@ def get_access_token(*, force_refresh: bool = False) -> str:
                 raise ValueError("OAuth response missing access token")
 
             expires_in = int(payload.get("expiresIn") or payload.get("expires_in") or 3600)
-            _TOKEN_CACHE["access_token"] = token
-            _TOKEN_CACHE["expires_at"] = now + expires_in
+            bucket["access_token"] = token
+            bucket["expires_at"] = now + expires_in
             return token
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
@@ -67,5 +70,4 @@ def get_access_token(*, force_refresh: bool = False) -> str:
 
 
 def clear_token_cache() -> None:
-    _TOKEN_CACHE["access_token"] = None
-    _TOKEN_CACHE["expires_at"] = 0.0
+    _TOKEN_CACHE.clear()
