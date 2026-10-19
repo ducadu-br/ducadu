@@ -103,12 +103,16 @@ Para marcar **“Usar Neon (ingest Lambda)”** no painel com dados:
 **Local (dia de demo homolog):**
 
 ```powershell
-cd c:\Users\luke2\Documents\ducadu
+aws sso login --profile AdministratorAccess-589452309659
+cd c:\Users\luke2\Documents\ducadu\apps\ifood_homolog
+$env:AWS_PROFILE="AdministratorAccess-589452309659"
+$env:AWS_REGION="sa-east-1"
 $env:IFOOD_INGEST_DAY="2025-08-01"
-uv run python scripts/run_ifood_ingest_local.py
+$env:IFOOD_INGEST_INCREMENTAL="false"
+uv run python run_ingest_local.py
 ```
 
-Requer credenciais AWS (landing S3) + tunnel/`DATABASE_URL` como acima. O script roda **`incremental=false`** só naquele dia.
+O login SSO **não** define perfil para o Python: sem `AWS_PROFILE`, o boto3 falha com `NoCredentialsError`. Alternativa: `AWS_PROFILE=...` no `.env` da raiz (não commitar). Requer escrita em `ducadu-landing` + tunnel/`DATABASE_URL` como acima. `IFOOD_INGEST_ANALYTICS` omitido ou `false` em produção sem app BI. O script roda **`incremental=false`** só naquele dia.
 
 **Lambda AWS** (`ingest_ifood`), evento exemplo:
 
@@ -255,10 +259,10 @@ Não incluir `client_secret` nem tokens completos.
 Checklist após aprovação do iFood (três apps de produção):
 
 1. **Autorizar lojas** — cada unidade Ducadu deve autorizar os **três** `client_id` no fluxo do Portal do Parceiro (ou rede, se o app BI for por `chain_id`). Sem isso, `GET /merchants` ou as APIs retornam vazio/403.
-2. **`.env` local / Lambda** — `IFOOD_USE_HOMOLOGATION=false`; secrets `IFOOD_FINANCE_*`, `IFOOD_BI_*`, `IFOOD_REVIEW_*` (não commitar). Opcional: `IFOOD_MERCHANT_IDS=uuid1,uuid2` para limitar ingest.
+2. **`.env` local / Lambda** — `IFOOD_USE_HOMOLOGATION=false`; secrets `IFOOD_FINANCE_*`, `IFOOD_BI_*`, `IFOOD_REVIEW_*` (não commitar). `IFOOD_INGEST_ANALYTICS=false` enquanto o app BI estiver pendente. Aplicar [`sql/005_ifood_financial.sql`](../sql/005_ifood_financial.sql) no Neon. Opcional: `IFOOD_MERCHANT_IDS=uuid1,uuid2` para limitar ingest.
 3. **Deploy Lambda** — replicar as mesmas variáveis no secret/ambiente AWS do `ingest_ifood`.
 4. **Smoke test** — `uv run --project apps/ifood_homolog python apps/ifood_homolog/auth_demo.py` (ainda usa legado; melhor abrir Streamlit e listar lojas na aba Financial).
-5. **Ingest D-1** — rodar lambda ou `scripts/run_ifood_ingest_local.py` para ontem; validar Neon (`ifood_orders`, `ifood_analytics_kpi_daily`, `ifood_reviews`).
+5. **Ingest D-1** — rodar lambda ou `apps/ifood_homolog/run_ingest_local.py` para ontem; validar Neon (`ifood_orders`, tabelas `005`, `ifood_reviews`; Analytics só com BI).
 6. **Review “parcialmente homologado”** — normal: Merchant não foi homologado de novo no app Avaliações; o módulo Review em si já está liberado (mensagem do suporte).
 
 ## Referências

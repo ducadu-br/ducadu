@@ -8,4 +8,5 @@ dependencies = [
     "requests>=2.31",
     "psycopg[binary]>=3.2",
     "python-dotenv>=1.0",
+    "boto3>=1.34",
 ]

@@ -71,3 +71,18 @@ def mark_success(prefix: str):
         Key=f"{prefix}_SUCCESS",
         Body=b""
     )
+
+
+def save_bytes(
+    data: bytes,
+    key: str,
+    *,
+    content_type: str = "application/octet-stream",
+) -> str:
+    s3.put_object(
+        Bucket=LANDING_BUCKET,
+        Key=key,
+        Body=data,
+        ContentType=content_type,
+    )
+    return key

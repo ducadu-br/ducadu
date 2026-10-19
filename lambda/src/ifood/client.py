@@ -90,6 +90,30 @@ class IfoodClient:
             },
         )
 
+    def iter_financial_event_pages(
+        self,
+        merchant_id: str,
+        *,
+        begin: date,
+        end: date,
+        max_pages: int = 100,
+    ):
+        page = 1
+        while page <= max_pages:
+            payload = self.list_financial_events(merchant_id, begin=begin, end=end, page=page)
+            if isinstance(payload, list):
+                if not payload:
+                    break
+                yield {"financialEvents": payload, "hasNextPage": False}
+                break
+            events = payload.get("financialEvents") or []
+            if not events:
+                break
+            yield payload
+            if not payload.get("hasNextPage"):
+                break
+            page += 1
+
     def get_reconciliation(self, merchant_id: str, *, competence: str) -> dict:
         """Reconciliation API — competência YYYY-MM. Retorna link do CSV e totalizadores."""
         return self._request(
@@ -160,7 +184,16 @@ class IfoodClient:
         page = 1
         seen_order_ids: set[str] = set()
         while page <= max_pages:
-            payload = self.list_sales(merchant_id, begin=begin, end=end, page=page)
+            try:
+                payload = self.list_sales(merchant_id, begin=begin, end=end, page=page)
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code in (400, 404):
+                    break
+                raise
+            if not payload:
+                break
+            if not isinstance(payload, dict):
+                break
             sales = payload.get("sales") or []
             if not sales:
                 break
@@ -172,11 +205,18 @@ class IfoodClient:
 
             yield payload
 
-            # Financial API should advance `page` in the response; homologation fixtures often repeat page 1.
+            if payload.get("hasNextPage") is False:
+                break
+            page_count = payload.get("pageCount")
+            if page_count is not None and page >= int(page_count):
+                break
+
+            # Homologation fixtures often repeat page 1.
             resp_page = payload.get("page")
             if resp_page is not None and int(resp_page) < page:
                 break
-            if len(sales) < int(payload.get("size") or len(sales)):
+            page_size = int(payload.get("size") or len(sales))
+            if page_size and len(sales) < page_size:
                 break
 
             page += 1

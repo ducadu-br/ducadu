@@ -452,7 +452,8 @@ def render_performance_metas_tab(
         except Exception as exc:
             kpi_error = kpi_error or str(exc)
 
-    if not status_counts and not (homolog and use_db):
+    ingest_analytics = os.getenv("IFOOD_INGEST_ANALYTICS", "false").lower() in ("1", "true", "yes")
+    if not status_counts and not (homolog and use_db) and ingest_analytics:
         try:
             kpi_payload = fetch_kpis_group_by_status(merchant_id, period_begin, period_end)
             status_counts = parse_order_status_counts(kpi_payload)
@@ -460,11 +461,19 @@ def render_performance_metas_tab(
                 metrics_source = "API Analytics (ao vivo)"
         except Exception as exc:
             kpi_error = kpi_error or str(exc)
+            err_text = str(exc)
+            if "403" in err_text or "Forbidden" in err_text or "OAuth" in err_text:
+                st.warning(
+                    "Analytics (app BI) indisponível — exibindo pedidos via **Financial** "
+                    "(`ifood_orders` ou vendas da aba Conciliação)."
+                )
     elif not status_counts and use_db and not fin_total:
         kpi_error = (
             kpi_error
-            or "Nenhum dado ingerido no período — rode `ingest_ifood` (Financial + Analytics)."
+            or "Nenhum dado ingerido no período — rode `ingest_ifood` (Financial; Analytics opcional)."
         )
+    elif not status_counts and not ingest_analytics and not homolog:
+        st.info("Analytics (BI) pausado — métricas de pedidos vêm do ingest **Financial**.")
 
     if metrics_source:
         st.caption(f"Fonte: **{metrics_source}**")
@@ -730,7 +739,7 @@ def render_homolog_dashboard(*, show_page_header: bool = True) -> None:
                     else:
                         st.warning(
                             "Nenhuma venda no Neon para esta loja. Rode ingest (ex.: "
-                            "`IFOOD_INGEST_DAY=2025-08-01` + `scripts/run_ifood_ingest_local.py`)."
+                            "`IFOOD_INGEST_DAY=2025-08-01` + `apps/ifood_homolog/run_ingest_local.py`)."
                         )
                 except Exception:
                     st.warning(

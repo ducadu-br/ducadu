@@ -1,22 +1,37 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timezone
+import hashlib
+import json
 import os
 
+import requests
 from psycopg.types.json import Json
 
 from src.config import (
     IFOOD_MERCHANT_IDS,
     LANDING_IFOOD_ANALYTICS,
+    LANDING_IFOOD_ANTICIPATIONS,
+    LANDING_IFOOD_FINANCIAL_EVENTS,
+    LANDING_IFOOD_RECONCILIATION,
     LANDING_IFOOD_REVIEWS,
     LANDING_IFOOD_REVIEW_SUMMARY,
     LANDING_IFOOD_SALES,
+    LANDING_IFOOD_SETTLEMENTS,
 )
 from src.db import get_conn, upsert
+from src.ifood.auth import get_access_token
 from src.ifood.client import IfoodClient
 from src.ifood.kpis import day_reference_bounds, orders_kpis_body_order_status, parse_order_status_counts
 from src.utils.dates import daterange
-from src.utils.storage import already_ingested, build_prefix, delete_prefix, mark_success, save_json
+from src.utils.storage import (
+    already_ingested,
+    build_prefix,
+    delete_prefix,
+    mark_success,
+    save_bytes,
+    save_json,
+)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -37,6 +52,43 @@ def _ingest_clients() -> tuple[IfoodClient, IfoodClient, IfoodClient]:
         IfoodClient(credential="finance"),
         IfoodClient(credential="bi"),
         IfoodClient(credential="review"),
+    )
+
+
+def _oauth_available(credential: str) -> bool:
+    try:
+        get_access_token(credential=credential)
+        return True
+    except Exception as exc:
+        print(f"[WARN] iFood OAuth unavailable for credential={credential}: {exc}")
+        return False
+
+
+def _parse_iso_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    return date.fromisoformat(value[:10])
+
+
+def _financial_event_hash(merchant_id: str, ev: dict) -> str:
+    canonical = json.dumps(ev, sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(f"{merchant_id}:{canonical}".encode("utf-8")).hexdigest()
+
+
+def transform_financial_event_row(merchant_id: str, ev: dict) -> tuple:
+    period = ev.get("period") or {}
+    amount_obj = ev.get("amount") or {}
+    amount = amount_obj.get("value")
+    return (
+        _financial_event_hash(merchant_id, ev),
+        merchant_id,
+        _parse_iso_date(period.get("beginDate")),
+        _parse_iso_date(period.get("endDate")),
+        period.get("idSaldo"),
+        ev.get("name"),
+        float(amount) if amount is not None else None,
+        ev.get("hasTransferImpact"),
+        Json(ev),
     )
 
 
@@ -228,6 +280,226 @@ ON CONFLICT (merchant_id, snapshot_date) DO UPDATE SET
     raw_summary = EXCLUDED.raw_summary,
     ingested_at = NOW();
 """
+
+UPSERT_FINANCIAL_EVENTS_SQL = """
+INSERT INTO ifood_financial_events (
+    event_hash, merchant_id, period_begin, period_end, id_saldo,
+    event_name, amount, has_transfer_impact, raw_event
+)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (event_hash) DO UPDATE SET
+    merchant_id         = EXCLUDED.merchant_id,
+    period_begin        = EXCLUDED.period_begin,
+    period_end          = EXCLUDED.period_end,
+    id_saldo            = EXCLUDED.id_saldo,
+    event_name          = EXCLUDED.event_name,
+    amount              = EXCLUDED.amount,
+    has_transfer_impact = EXCLUDED.has_transfer_impact,
+    raw_event           = EXCLUDED.raw_event,
+    ingested_at         = NOW();
+"""
+
+UPSERT_SETTLEMENTS_SQL = """
+INSERT INTO ifood_settlements_snapshots (
+    merchant_id, begin_calculation, end_calculation, balance, raw_response
+)
+VALUES (%s, %s, %s, %s, %s)
+ON CONFLICT (merchant_id, begin_calculation, end_calculation) DO UPDATE SET
+    balance      = EXCLUDED.balance,
+    raw_response = EXCLUDED.raw_response,
+    ingested_at  = NOW();
+"""
+
+UPSERT_ANTICIPATIONS_SQL = """
+INSERT INTO ifood_anticipations_snapshots (
+    merchant_id, begin_calculation, end_calculation, balance, raw_response
+)
+VALUES (%s, %s, %s, %s, %s)
+ON CONFLICT (merchant_id, begin_calculation, end_calculation) DO UPDATE SET
+    balance      = EXCLUDED.balance,
+    raw_response = EXCLUDED.raw_response,
+    ingested_at  = NOW();
+"""
+
+UPSERT_RECONCILIATION_SQL = """
+INSERT INTO ifood_reconciliation_files (
+    merchant_id, competence, api_created_at, landing_s3_key
+)
+VALUES (%s, %s, %s, %s)
+ON CONFLICT (merchant_id, competence) DO UPDATE SET
+    api_created_at  = EXCLUDED.api_created_at,
+    landing_s3_key  = EXCLUDED.landing_s3_key,
+    ingested_at     = NOW();
+"""
+
+
+def _ingest_financial_events_day(
+    client: IfoodClient,
+    *,
+    merchant_id: str,
+    day: date,
+    incremental: bool,
+) -> int:
+    prefix = build_prefix(LANDING_IFOOD_FINANCIAL_EVENTS, merchant_id, str(day))
+    if incremental and already_ingested(prefix):
+        print(f"[SKIP] iFood financial events merchant={merchant_id} day={day}")
+        return 0
+
+    if not incremental:
+        delete_prefix(prefix)
+
+    print(f"[INFO] iFood financial events merchant={merchant_id} day={day}")
+    rows: list[tuple] = []
+    for page_idx, payload in enumerate(
+        client.iter_financial_event_pages(merchant_id, begin=day, end=day),
+        start=1,
+    ):
+        save_json(payload, prefix=prefix, file_prefix=f"page={page_idx:03d}")
+        for ev in payload.get("financialEvents") or []:
+            rows.append(transform_financial_event_row(merchant_id, ev))
+
+    if rows:
+        conn = get_conn()
+        try:
+            upsert(conn, UPSERT_FINANCIAL_EVENTS_SQL, rows)
+        finally:
+            conn.close()
+        mark_success(prefix)
+
+    print(f"[DONE-DAY] iFood financial events merchant={merchant_id} day={day} rows={len(rows)}")
+    return len(rows)
+
+
+def _ingest_settlements_day(
+    client: IfoodClient,
+    *,
+    merchant_id: str,
+    day: date,
+    incremental: bool,
+) -> int:
+    prefix = build_prefix(LANDING_IFOOD_SETTLEMENTS, merchant_id, str(day))
+    if incremental and already_ingested(prefix):
+        print(f"[SKIP] iFood settlements merchant={merchant_id} day={day}")
+        return 0
+
+    if not incremental:
+        delete_prefix(prefix)
+
+    print(f"[INFO] iFood settlements merchant={merchant_id} day={day}")
+    payload = client.list_settlements(
+        merchant_id,
+        begin_calculation=day,
+        end_calculation=day,
+    )
+    save_json(payload, prefix=prefix, file_prefix="settlements")
+    balance = payload.get("balance")
+    row = (
+        merchant_id,
+        day,
+        day,
+        float(balance) if balance is not None else None,
+        Json(payload),
+    )
+    conn = get_conn()
+    try:
+        upsert(conn, UPSERT_SETTLEMENTS_SQL, [row])
+    finally:
+        conn.close()
+    mark_success(prefix)
+    print(f"[DONE-DAY] iFood settlements merchant={merchant_id} day={day} ok")
+    return 1
+
+
+def _ingest_anticipations_day(
+    client: IfoodClient,
+    *,
+    merchant_id: str,
+    day: date,
+    incremental: bool,
+) -> int:
+    prefix = build_prefix(LANDING_IFOOD_ANTICIPATIONS, merchant_id, str(day))
+    if incremental and already_ingested(prefix):
+        print(f"[SKIP] iFood anticipations merchant={merchant_id} day={day}")
+        return 0
+
+    if not incremental:
+        delete_prefix(prefix)
+
+    print(f"[INFO] iFood anticipations merchant={merchant_id} day={day}")
+    payload = client.list_anticipations(
+        merchant_id,
+        begin_calculation=day,
+        end_calculation=day,
+    )
+    save_json(payload, prefix=prefix, file_prefix="anticipations")
+    balance = payload.get("balance")
+    row = (
+        merchant_id,
+        day,
+        day,
+        float(balance) if balance is not None else None,
+        Json(payload),
+    )
+    conn = get_conn()
+    try:
+        upsert(conn, UPSERT_ANTICIPATIONS_SQL, [row])
+    finally:
+        conn.close()
+    mark_success(prefix)
+    print(f"[DONE-DAY] iFood anticipations merchant={merchant_id} day={day} ok")
+    return 1
+
+
+def _ingest_reconciliation_competence(
+    client: IfoodClient,
+    *,
+    merchant_id: str,
+    day: date,
+    incremental: bool,
+) -> int:
+    competence = f"{day.year}-{day.month:02d}"
+    prefix = build_prefix(LANDING_IFOOD_RECONCILIATION, merchant_id, competence)
+    if incremental and already_ingested(prefix):
+        print(f"[SKIP] iFood reconciliation merchant={merchant_id} competence={competence}")
+        return 0
+
+    if not incremental:
+        delete_prefix(prefix)
+
+    print(f"[INFO] iFood reconciliation merchant={merchant_id} competence={competence}")
+    try:
+        meta = client.get_reconciliation(merchant_id, competence=competence)
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            print(
+                f"[SKIP] iFood reconciliation not available merchant={merchant_id} "
+                f"competence={competence}"
+            )
+            return 0
+        raise
+    meta_safe = {k: v for k, v in meta.items() if k != "downloadPath"}
+    save_json(meta_safe, prefix=prefix, file_prefix="metadata")
+
+    landing_key = f"{prefix}extract.csv.gz"
+    download_path = meta.get("downloadPath")
+    if download_path:
+        response = requests.get(download_path, timeout=120)
+        response.raise_for_status()
+        save_bytes(response.content, landing_key, content_type="application/gzip")
+    else:
+        print(f"[WARN] reconciliation without downloadPath merchant={merchant_id} competence={competence}")
+        landing_key = f"{prefix}metadata_only"
+
+    created = _parse_ts(meta.get("createdAt"))
+    row = (merchant_id, competence, created, landing_key)
+    conn = get_conn()
+    try:
+        upsert(conn, UPSERT_RECONCILIATION_SQL, [row])
+    finally:
+        conn.close()
+    mark_success(prefix)
+    print(f"[DONE-DAY] iFood reconciliation merchant={merchant_id} competence={competence} ok")
+    return 1
 
 
 def _ingest_analytics_day(
@@ -433,10 +705,21 @@ def main(
         raise RuntimeError("Nenhum merchant iFood configurado ou retornado pela API")
 
     fetch_order_details = _env_bool("IFOOD_FETCH_ORDER_DETAILS", False)
+    ingest_analytics = _env_bool("IFOOD_INGEST_ANALYTICS", False) and _oauth_available("bi")
+    ingest_review = _oauth_available("review")
+    if not ingest_review:
+        print("[WARN] Review OAuth unavailable — skipping reviews and review summary")
+    if _env_bool("IFOOD_INGEST_ANALYTICS", False) and not ingest_analytics:
+        print("[WARN] IFOOD_INGEST_ANALYTICS=true but BI OAuth failed — skipping Analytics")
+
     total_orders = 0
     total_reviews = 0
     total_analytics = 0
     total_summaries = 0
+    total_fin_events = 0
+    total_settlements = 0
+    total_anticipations = 0
+    total_reconciliation = 0
 
     for merchant_id in merchant_ids:
         print(f"\n===== IFOOD MERCHANT: {merchant_id} =====")
@@ -449,26 +732,54 @@ def main(
                 incremental=incremental,
                 fetch_order_details=fetch_order_details,
             )
-            total_reviews += _ingest_reviews_day(
-                review_client,
+            total_fin_events += _ingest_financial_events_day(
+                finance_client,
                 merchant_id=merchant_id,
                 day=day,
                 incremental=incremental,
             )
-            total_analytics += _ingest_analytics_day(
-                bi_client,
+            total_settlements += _ingest_settlements_day(
+                finance_client,
                 merchant_id=merchant_id,
                 day=day,
                 incremental=incremental,
             )
-            total_summaries += _ingest_review_summary_day(
-                review_client,
+            total_anticipations += _ingest_anticipations_day(
+                finance_client,
                 merchant_id=merchant_id,
                 day=day,
                 incremental=incremental,
             )
+            total_reconciliation += _ingest_reconciliation_competence(
+                finance_client,
+                merchant_id=merchant_id,
+                day=day,
+                incremental=incremental,
+            )
+            if ingest_review:
+                total_reviews += _ingest_reviews_day(
+                    review_client,
+                    merchant_id=merchant_id,
+                    day=day,
+                    incremental=incremental,
+                )
+                total_summaries += _ingest_review_summary_day(
+                    review_client,
+                    merchant_id=merchant_id,
+                    day=day,
+                    incremental=incremental,
+                )
+            if ingest_analytics:
+                total_analytics += _ingest_analytics_day(
+                    bi_client,
+                    merchant_id=merchant_id,
+                    day=day,
+                    incremental=incremental,
+                )
 
     print(
-        f"[DONE] iFood ingest orders={total_orders} reviews={total_reviews} "
+        f"[DONE] iFood ingest orders={total_orders} fin_events={total_fin_events} "
+        f"settlements={total_settlements} anticipations={total_anticipations} "
+        f"reconciliation={total_reconciliation} reviews={total_reviews} "
         f"analytics_days={total_analytics} review_summaries={total_summaries}"
     )

@@ -87,6 +87,10 @@ LANDING_IFOOD_SALES = "ifood_sales"
 LANDING_IFOOD_REVIEWS = "ifood_reviews"
 LANDING_IFOOD_ANALYTICS = "ifood_analytics"
 LANDING_IFOOD_REVIEW_SUMMARY = "ifood_review_summary"
+LANDING_IFOOD_FINANCIAL_EVENTS = "ifood_financial_events"
+LANDING_IFOOD_SETTLEMENTS = "ifood_settlements"
+LANDING_IFOOD_ANTICIPATIONS = "ifood_anticipations"
+LANDING_IFOOD_RECONCILIATION = "ifood_reconciliation"
 
 # Comma-separated merchant UUIDs; empty = all merchants returned by GET /merchants
 IFOOD_MERCHANT_IDS = [
