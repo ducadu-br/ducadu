@@ -18,4 +18,14 @@ create_success.py
 .vscode/
 proposta-dashboard-ducadu.md
 clean_and_classifies_products.py
+
+# Pastas locais / fora do escopo versionado neste repo
+docs/
+apps/
+
+# Logs de backfill/ingest local
 scripts/*
+!scripts/run_ingest_local.py
+!scripts/run_backfill_local.py
+scripts/*.log
+scripts/backfill-*.log

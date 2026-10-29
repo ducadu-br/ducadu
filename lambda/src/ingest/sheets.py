@@ -22,9 +22,23 @@ def _rows(gc, tab: str) -> list[dict]:
 
 
 INSERT_DIM_LOJAS_SQL = """
-INSERT INTO dim_lojas (id, loja)
-VALUES (%s, %s)
+INSERT INTO dim_lojas (id, loja, merchant_id)
+VALUES (%s, %s, %s)
 """
+
+
+def _optional_uuid(val) -> str | None:
+    if val in (None, "", "null", "None"):
+        return None
+    s = str(val).strip()
+    return s or None
+
+
+def _merchant_id_from_row(row: dict) -> str | None:
+    for key in ("merchant_id", "ifood_merchant_id", "merchant_id_ifood"):
+        if key in row:
+            return _optional_uuid(row[key])
+    return None
 
 INSERT_DIM_PRODUTOS_SQL = """
 INSERT INTO dim_produtos (nome_origem, nome_destino, categoria, origem_tipo)
@@ -53,7 +67,10 @@ def _to_decimal(val):
         return None
     
 def _ingest_dim_lojas(conn, gc) -> None:
-    rows = [(r["id"], r["loja"]) for r in _rows(gc, "de-para lojas")]
+    rows = [
+        (r["id"], r["loja"], _merchant_id_from_row(r))
+        for r in _rows(gc, "de-para lojas")
+    ]
     execute(conn, "TRUNCATE TABLE dim_lojas")
     if rows:
         upsert(conn, INSERT_DIM_LOJAS_SQL, rows)

@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import time
 from datetime import date
 from typing import Any
 
 import requests
 
-from src.config import DEFAULT_TIMEOUT, IFOOD_API_BASE, IFOOD_USE_HOMOLOGATION_HEADER
+from src.config import (
+    DEFAULT_BACKOFF,
+    DEFAULT_RETRIES,
+    DEFAULT_TIMEOUT,
+    IFOOD_API_BASE,
+    IFOOD_USE_HOMOLOGATION_HEADER,
+)
 from src.ifood.auth import get_access_token
 
 
@@ -40,20 +47,32 @@ class IfoodClient:
         allow_empty: bool = False,
     ) -> Any:
         headers = self._headers_json() if json_body is not None else self._headers()
-        response = requests.request(
-            method,
-            self._url(path),
-            headers=headers,
-            params=params,
-            json=json_body,
-            timeout=self._timeout,
-        )
-        if allow_empty and response.status_code == 204:
-            return None
-        response.raise_for_status()
-        if not response.content:
-            return None
-        return response.json()
+        last_exc: Exception | None = None
+        for attempt in range(1, DEFAULT_RETRIES + 1):
+            try:
+                response = requests.request(
+                    method,
+                    self._url(path),
+                    headers=headers,
+                    params=params,
+                    json=json_body,
+                    timeout=self._timeout,
+                )
+                if allow_empty and response.status_code == 204:
+                    return None
+                response.raise_for_status()
+                if not response.content:
+                    return None
+                return response.json()
+            except (requests.HTTPError, requests.RequestException) as exc:
+                last_exc = exc
+                if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                    if exc.response.status_code < 500 and exc.response.status_code != 429:
+                        raise
+                if attempt == DEFAULT_RETRIES:
+                    raise
+                time.sleep(DEFAULT_BACKOFF * attempt)
+        raise last_exc  # pragma: no cover
 
     def list_merchants(self) -> list[dict]:
         data = self._request("GET", "/merchant/v1.0/merchants")
