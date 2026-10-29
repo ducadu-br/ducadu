@@ -270,10 +270,14 @@ class IfoodClient:
 
             yield payload
 
+            page_count = payload.get("pageCount")
+            if page_count is not None and page >= int(page_count):
+                break
             resp_page = payload.get("page")
             if resp_page is not None and int(resp_page) < page:
                 break
-            if len(reviews) < int(payload.get("size") or size):
+            page_size = int(payload.get("pageSize") or payload.get("size") or size)
+            if page_size and len(reviews) < page_size:
                 break
 
             page += 1
@@ -286,13 +290,13 @@ class IfoodClient:
         end: date | None = None,
         page: int = 1,
         size: int = 50,
-        add_count: bool = False,
+        add_count: bool = True,
     ) -> dict:
-        params: dict[str, str | int | bool] = {"page": page, "size": size}
+        params: dict[str, str | int | bool] = {"page": page, "pageSize": size}
         if begin:
-            params["beginReviewDate"] = begin.isoformat()
+            params["dateFrom"] = f"{begin.isoformat()}T00:00:00Z"
         if end:
-            params["endReviewDate"] = end.isoformat()
+            params["dateTo"] = f"{end.isoformat()}T23:59:59Z"
         if add_count:
             params["addCount"] = "true"
         return self._request(

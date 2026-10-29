@@ -1,4 +1,8 @@
-"""Backfill iFood ingest month-by-month (same code path as Lambda)."""
+"""Backfill iFood ingest month-by-month (same code path as Lambda).
+
+Run from repo root:
+  uv run --directory scripts python run_backfill_local.py
+"""
 from __future__ import annotations
 
 import calendar
@@ -31,6 +35,8 @@ def main() -> None:
     to_month = int(os.getenv("IFOOD_BACKFILL_TO_MONTH", "12"))
     incremental = os.getenv("IFOOD_INGEST_INCREMENTAL", "true").lower() in ("1", "true", "yes")
     cap = os.getenv("IFOOD_BACKFILL_THROUGH_YESTERDAY", "true").lower() in ("1", "true", "yes")
+    end_cap_raw = os.getenv("IFOOD_BACKFILL_END_DATE")
+    end_cap = date.fromisoformat(end_cap_raw) if end_cap_raw else None
     yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
 
     print(
@@ -40,6 +46,11 @@ def main() -> None:
 
     for month in range(from_month, to_month + 1):
         start_day, end_day = _month_bounds(year, month)
+        if end_cap is not None:
+            if start_day > end_cap:
+                print(f"[BACKFILL] skip {year}-{month:02d} (after end cap {end_cap})")
+                continue
+            end_day = min(end_day, end_cap)
         if cap:
             end_day = min(end_day, yesterday)
         if start_day > end_day:

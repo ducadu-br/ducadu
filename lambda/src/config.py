@@ -18,7 +18,7 @@ IFOOD_CLIENT_ID = os.getenv("IFOOD_CLIENT_ID")
 IFOOD_CLIENT_SECRET = os.getenv("IFOOD_CLIENT_SECRET")
 IFOOD_API_BASE = os.getenv("IFOOD_API_BASE", "https://merchant-api.ifood.com.br")
 IFOOD_AUTH_URL = f"{IFOOD_API_BASE.rstrip('/')}/authentication/v1.0/oauth/token"
-IFOOD_USE_HOMOLOGATION_HEADER = os.getenv("IFOOD_USE_HOMOLOGATION", "true").lower() in (
+IFOOD_USE_HOMOLOGATION_HEADER = os.getenv("IFOOD_USE_HOMOLOGATION", "false").lower() in (
     "1",
     "true",
     "yes",

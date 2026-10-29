@@ -1,4 +1,8 @@
-"""Run iFood D-1 ingest locally (same entry as Lambda `ingest_ifood`)."""
+"""Run iFood D-1 ingest locally (same entry as Lambda `ingest_ifood`).
+
+Run from repo root:
+  uv run --directory scripts python run_ingest_local.py
+"""
 from __future__ import annotations
 
 import os
@@ -39,7 +43,7 @@ def ensure_aws_credentials() -> None:
             "Credenciais AWS não disponíveis para o boto3.\n"
             "  1. aws sso login --profile <seu-perfil>\n"
             "  2. $env:AWS_PROFILE=\"<seu-perfil>\"   (ou AWS_PROFILE no .env na raiz do repo)\n"
-            "  3. python scripts/run_ingest_local.py\n"
+            "  3. uv run --directory scripts python run_ingest_local.py\n"
             f"Erro: {exc}"
         )
         raise SystemExit(msg) from exc

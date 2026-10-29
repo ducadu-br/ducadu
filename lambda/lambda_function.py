@@ -8,6 +8,8 @@ from src.ingest.ingest_job import main
 
 def _parse_event(event: dict) -> tuple[datetime, datetime, bool, list[str] | None]:
     today: date = datetime.now(timezone.utc).date()
+    yesterday = today - timedelta(days=1)
+    lookback_days = int(event.get("lookback_days") or 2)
 
     raw_start = event.get("start_date")
     raw_end = event.get("end_date")
@@ -16,12 +18,12 @@ def _parse_event(event: dict) -> tuple[datetime, datetime, bool, list[str] | Non
 
     try:
         start_date = datetime.combine(
-            datetime.strptime(raw_start, "%Y-%m-%d").date() if raw_start else today - timedelta(days=2),
+            datetime.strptime(raw_start, "%Y-%m-%d").date() if raw_start else yesterday - timedelta(days=lookback_days - 1),
             time.min,
             tzinfo=timezone.utc,
         )
         end_date = datetime.combine(
-            datetime.strptime(raw_end, "%Y-%m-%d").date() if raw_end else today,
+            datetime.strptime(raw_end, "%Y-%m-%d").date() if raw_end else yesterday,
             time.max,
             tzinfo=timezone.utc,
         )

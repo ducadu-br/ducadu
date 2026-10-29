@@ -177,11 +177,18 @@ def transform_review_row(review: dict, *, merchant_id: str) -> tuple | None:
     if not rid:
         return None
 
-    created = _parse_ts(review.get("createdAt") or review.get("reviewedAt"))
+    order_obj = review.get("order") if isinstance(review.get("order"), dict) else {}
+    created = _parse_ts(
+        review.get("createdAt")
+        or review.get("reviewedAt")
+        or order_obj.get("createdAt")
+    )
     review_date = created.date() if created else None
     rating = review.get("score") or review.get("rating") or review.get("grade")
     comment = review.get("comment") or review.get("description")
-    order_id = review.get("orderId") or review.get("order_id")
+    if isinstance(comment, str) and not comment.strip():
+        comment = None
+    order_id = order_obj.get("id") or review.get("orderId") or review.get("order_id")
 
     return (
         rid,
@@ -326,11 +333,32 @@ INSERT INTO ifood_reconciliation_files (
     merchant_id, competence, api_created_at, landing_s3_key
 )
 VALUES (%s, %s, %s, %s)
-ON CONFLICT (merchant_id, competence) DO UPDATE SET
+    ON CONFLICT (merchant_id, competence) DO UPDATE SET
     api_created_at  = EXCLUDED.api_created_at,
     landing_s3_key  = EXCLUDED.landing_s3_key,
     ingested_at     = NOW();
 """
+
+
+def _competences_between(start: date, end: date) -> list[str]:
+    cur = date(start.year, start.month, 1)
+    end_month = date(end.year, end.month, 1)
+    out: list[str] = []
+    while cur <= end_month:
+        out.append(f"{cur.year}-{cur.month:02d}")
+        if cur.month == 12:
+            cur = date(cur.year + 1, 1, 1)
+        else:
+            cur = date(cur.year, cur.month + 1, 1)
+    return out
+
+
+def _ingest_step(label: str, fn) -> int:
+    try:
+        return fn()
+    except Exception as exc:
+        print(f"[ERROR] {label}: {exc}")
+        return 0
 
 
 def _ingest_financial_events_day(
@@ -364,7 +392,7 @@ def _ingest_financial_events_day(
             upsert(conn, UPSERT_FINANCIAL_EVENTS_SQL, rows)
         finally:
             conn.close()
-        mark_success(prefix)
+    mark_success(prefix)
 
     print(f"[DONE-DAY] iFood financial events merchant={merchant_id} day={day} rows={len(rows)}")
     return len(rows)
@@ -481,7 +509,12 @@ def _ingest_reconciliation_competence(
     save_json(meta_safe, prefix=prefix, file_prefix="metadata")
 
     landing_key = f"{prefix}extract.csv.gz"
-    download_path = meta.get("downloadPath")
+    download_path = (
+        meta.get("downloadPath")
+        or meta.get("downloadUrl")
+        or meta.get("url")
+        or meta.get("fileUrl")
+    )
     if download_path:
         response = requests.get(download_path, timeout=120)
         response.raise_for_status()
@@ -568,6 +601,7 @@ def _ingest_review_summary_day(
     print(f"[INFO] iFood review summary merchant={merchant_id} day={day}")
     summary = client.get_review_summary(merchant_id)
     if summary is None:
+        mark_success(prefix)
         print(f"[DONE-DAY] iFood review summary merchant={merchant_id} day={day} rows=0 (404)")
         return 0
 
@@ -610,6 +644,7 @@ def _ingest_sales_day(
         all_sales.extend(sales)
 
     if not all_sales:
+        mark_success(prefix)
         print(f"[DONE-DAY] iFood sales merchant={merchant_id} day={day} rows=0")
         return 0
 
@@ -686,8 +721,8 @@ def _ingest_reviews_day(
             upsert(conn, UPSERT_REVIEWS_SQL, review_rows)
         finally:
             conn.close()
-        mark_success(prefix)
 
+    mark_success(prefix)
     print(f"[DONE-DAY] iFood reviews merchant={merchant_id} day={day} rows={len(review_rows)}")
     return len(review_rows)
 
@@ -705,7 +740,7 @@ def main(
         raise RuntimeError("Nenhum merchant iFood configurado ou retornado pela API")
 
     fetch_order_details = _env_bool("IFOOD_FETCH_ORDER_DETAILS", False)
-    ingest_analytics = _env_bool("IFOOD_INGEST_ANALYTICS", False) and _oauth_available("bi")
+    ingest_analytics = _env_bool("IFOOD_INGEST_ANALYTICS", True) and _oauth_available("bi")
     ingest_review = _oauth_available("review")
     if not ingest_review:
         print("[WARN] Review OAuth unavailable — skipping reviews and review summary")
@@ -721,61 +756,91 @@ def main(
     total_anticipations = 0
     total_reconciliation = 0
 
+    range_start = start_date.date()
+    range_end = end_date.date()
+
     for merchant_id in merchant_ids:
         print(f"\n===== IFOOD MERCHANT: {merchant_id} =====")
         for day_start, _day_end in daterange(start_date, end_date):
             day = day_start.date()
-            total_orders += _ingest_sales_day(
-                finance_client,
-                merchant_id=merchant_id,
-                day=day,
-                incremental=incremental,
-                fetch_order_details=fetch_order_details,
+            total_orders += _ingest_step(
+                f"sales {merchant_id} {day}",
+                lambda d=day, m=merchant_id: _ingest_sales_day(
+                    finance_client,
+                    merchant_id=m,
+                    day=d,
+                    incremental=incremental,
+                    fetch_order_details=fetch_order_details,
+                ),
             )
-            total_fin_events += _ingest_financial_events_day(
-                finance_client,
-                merchant_id=merchant_id,
-                day=day,
-                incremental=incremental,
+            total_fin_events += _ingest_step(
+                f"financial_events {merchant_id} {day}",
+                lambda d=day, m=merchant_id: _ingest_financial_events_day(
+                    finance_client,
+                    merchant_id=m,
+                    day=d,
+                    incremental=incremental,
+                ),
             )
-            total_settlements += _ingest_settlements_day(
-                finance_client,
-                merchant_id=merchant_id,
-                day=day,
-                incremental=incremental,
+            total_settlements += _ingest_step(
+                f"settlements {merchant_id} {day}",
+                lambda d=day, m=merchant_id: _ingest_settlements_day(
+                    finance_client,
+                    merchant_id=m,
+                    day=d,
+                    incremental=incremental,
+                ),
             )
-            total_anticipations += _ingest_anticipations_day(
-                finance_client,
-                merchant_id=merchant_id,
-                day=day,
-                incremental=incremental,
-            )
-            total_reconciliation += _ingest_reconciliation_competence(
-                finance_client,
-                merchant_id=merchant_id,
-                day=day,
-                incremental=incremental,
+            total_anticipations += _ingest_step(
+                f"anticipations {merchant_id} {day}",
+                lambda d=day, m=merchant_id: _ingest_anticipations_day(
+                    finance_client,
+                    merchant_id=m,
+                    day=d,
+                    incremental=incremental,
+                ),
             )
             if ingest_review:
-                total_reviews += _ingest_reviews_day(
-                    review_client,
-                    merchant_id=merchant_id,
-                    day=day,
-                    incremental=incremental,
+                total_reviews += _ingest_step(
+                    f"reviews {merchant_id} {day}",
+                    lambda d=day, m=merchant_id: _ingest_reviews_day(
+                        review_client,
+                        merchant_id=m,
+                        day=d,
+                        incremental=incremental,
+                    ),
                 )
-                total_summaries += _ingest_review_summary_day(
-                    review_client,
-                    merchant_id=merchant_id,
-                    day=day,
-                    incremental=incremental,
+                total_summaries += _ingest_step(
+                    f"review_summary {merchant_id} {day}",
+                    lambda d=day, m=merchant_id: _ingest_review_summary_day(
+                        review_client,
+                        merchant_id=m,
+                        day=d,
+                        incremental=incremental,
+                    ),
                 )
             if ingest_analytics:
-                total_analytics += _ingest_analytics_day(
-                    bi_client,
-                    merchant_id=merchant_id,
-                    day=day,
-                    incremental=incremental,
+                total_analytics += _ingest_step(
+                    f"analytics {merchant_id} {day}",
+                    lambda d=day, m=merchant_id: _ingest_analytics_day(
+                        bi_client,
+                        merchant_id=m,
+                        day=d,
+                        incremental=incremental,
+                    ),
                 )
+
+        for competence in _competences_between(range_start, range_end):
+            comp_day = date.fromisoformat(f"{competence}-01")
+            total_reconciliation += _ingest_step(
+                f"reconciliation {merchant_id} {competence}",
+                lambda d=comp_day, m=merchant_id: _ingest_reconciliation_competence(
+                    finance_client,
+                    merchant_id=m,
+                    day=d,
+                    incremental=incremental,
+                ),
+            )
 
     print(
         f"[DONE] iFood ingest orders={total_orders} fin_events={total_fin_events} "
